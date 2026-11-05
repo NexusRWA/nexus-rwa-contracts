@@ -95,7 +95,7 @@ fn test_transfer_batch_rejected_when_paused_with_deliberate_error() {
     let mut batch = Vec::new(&s.env);
     batch.push_back((bob.clone(), 100i128));
     let res = s.token.try_transfer_batch(&s.admin, &batch);
-    assert_eq!(res, Err(Ok(Error::Paused)));
+    assert_eq!(res, Err(Ok(Error::Paused.into())));
     assert_eq!(s.token.balance(&s.admin), 1_000);
     assert_eq!(s.token.balance(&bob), 0);
 }
@@ -111,7 +111,7 @@ fn test_transfer_batch_paused_empty_batch_and_unpause_restores() {
     let empty: Vec<(Address, i128)> = Vec::new(&s.env);
     assert_eq!(
         s.token.try_transfer_batch(&s.admin, &empty),
-        Err(Ok(Error::Paused))
+        Err(Ok(Error::Paused.into()))
     );
 
     s.token.unpause(&s.admin);

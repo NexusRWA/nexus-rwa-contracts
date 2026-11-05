@@ -43,7 +43,6 @@
 #[cfg(test)]
 extern crate std;
 
-use asset_token::AssetMetadata;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
     Env, Map, Vec,
@@ -54,7 +53,6 @@ use soroban_sdk::{
 #[contractclient(name = "AssetClient")]
 pub trait AssetInterface {
     fn total_supply(env: Env) -> i128;
-    fn get_metadata(env: Env) -> AssetMetadata;
 }
 
 /// Minimal payment-token interface used to move escrowed funds.
@@ -333,7 +331,7 @@ impl DividendContract {
         eligible: Vec<(Address, i128)>,
         deadline: u32,
     ) -> u64 {
-        Self::require_admin_or_asset_admin(&env, &admin, &asset_token);
+        Self::require_admin(&env, &admin);
         if total_amount <= 0 {
             panic_err(&env, Error::InvalidAmount);
         }
@@ -679,6 +677,101 @@ impl DividendContract {
         remaining
     }
 
+    /// Withdraw unclaimed funds from a distribution to a specified recipient.
+    ///
+    /// Works for both deadline and non-deadline distributions:
+    /// - For distributions with a deadline (`deadline != 0`), requires the
+    ///   deadline to have passed (`current_ledger > deadline`).
+    /// - For distributions without a deadline (`deadline == 0`), requires the
+    ///   distribution to be at least `min_age` ledgers old
+    ///   (`current_ledger >= created_at + min_age`).
+    ///
+    /// Sends the remaining unclaimed escrow to `recipient` and marks the
+    /// distribution `completed`. Admin only.
+    ///
+    /// # Parameters
+    /// - `admin`: Current admin address. Must authorize the call.
+    /// - `distribution_id`: Id of the distribution to withdraw from.
+    /// - `recipient`: Address to receive the remaining funds.
+    /// - `min_age`: Minimum ledger age (from `created_at`) required for
+    ///   deadline-less distributions. Ignored when `deadline != 0`.
+    ///
+    /// # Authority
+    /// `admin` must be the stored admin and must sign the transaction.
+    ///
+    /// # Errors
+    /// - [`Error::NotInitialized`] — contract not yet initialized.
+    /// - [`Error::Unauthorized`] — `admin` does not match the stored admin.
+    /// - [`Error::DistributionNotFound`] — no distribution with
+    ///   `distribution_id` exists.
+    /// - [`Error::DistributionTooYoung`] — distribution without a deadline
+    ///   has not yet reached its `min_age`.
+    /// - [`Error::DeadlineNotReached`] — distribution has a deadline that
+    ///   has not yet passed.
+    /// - [`Error::NothingToClaim`] — all funds were already claimed or
+    ///   the distribution was completed/cancelled.
+    ///
+    /// # Events
+    /// Emits topic `("withdraw", admin)` with data `(distribution_id, remaining)`.
+    pub fn withdraw_unclaimed(
+        env: Env,
+        admin: Address,
+        distribution_id: u64,
+        recipient: Address,
+        min_age: u32,
+    ) -> i128 {
+        Self::require_admin(&env, &admin);
+        let mut dist = Self::load(&env, distribution_id);
+
+        if dist.completed {
+            panic_err(&env, Error::NothingToClaim);
+        }
+
+        let now = env.ledger().sequence();
+        if dist.deadline != 0 {
+            // Deadline-based distribution: deadline must have passed.
+            if now <= dist.deadline {
+                panic_err(&env, Error::DeadlineNotReached);
+            }
+        } else {
+            // Non-deadline distribution: minimum age must have been reached.
+            if now < dist.created_at.saturating_add(min_age) {
+                panic_err(&env, Error::DistributionTooYoung);
+            }
+        }
+
+        let remaining = dist.total_amount - dist.distributed;
+        if remaining <= 0 {
+            panic_err(&env, Error::NothingToClaim);
+        }
+
+        let this = env.current_contract_address();
+        TokenClient::new(&env, &dist.payment_token).transfer(&this, &recipient, &remaining);
+
+        dist.distributed = dist.total_amount;
+        dist.completed = true;
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Snapshot(distribution_id));
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Supply(distribution_id));
+        env.storage()
+            .persistent()
+            .set(&DataKey::Dist(distribution_id), &dist);
+        env.storage().persistent().extend_ttl(
+            &DataKey::Dist(distribution_id),
+            INSTANCE_LIFETIME_THRESHOLD,
+            INSTANCE_BUMP_AMOUNT,
+        );
+        bump(&env);
+        env.events().publish(
+            (symbol_short!("withdraw"), admin),
+            (distribution_id, remaining),
+        );
+        remaining
+    }
+
     /// Cancel a distribution and return the full escrowed amount to the admin.
     ///
     /// Only permitted before any claim has been processed (`distributed == 0`).
@@ -890,23 +983,6 @@ impl DividendContract {
             .instance()
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_err(&env, Error::NotInitialized))
-    }
-
-    fn require_admin_or_asset_admin(env: &Env, admin: &Address, asset_token: &Address) {
-        let stored: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .unwrap_or_else(|| panic_err(env, Error::NotInitialized));
-        admin.require_auth();
-        if *admin == stored {
-            return;
-        }
-        let asset_admin = AssetClient::new(env, asset_token).get_metadata().admin;
-        if *admin == asset_admin {
-            return;
-        }
-        panic_err(env, Error::Unauthorized);
     }
 
     /// Propose a new admin. Requires authorization from the current admin.

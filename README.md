@@ -1,4 +1,4 @@
-# Soroban Contracts
+# Nexus RWA Contracts
 
 A collection of Soroban smart contracts for tokenized real-world assets, including an
 asset token, compliance rules, dividend distribution, and a registry.

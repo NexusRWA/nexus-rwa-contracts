@@ -128,7 +128,7 @@ fn test_create_distribution_escrows_funds() {
 }
 
 #[test]
-fn test_asset_admin_can_create_distribution() {
+fn test_dividend_admin_can_create_distribution() {
     let ctx = setup();
     let asset_admin = AssetTokenContractClient::new(&ctx.env, &ctx.asset_id)
         .get_metadata()
@@ -149,13 +149,8 @@ fn test_asset_admin_can_create_distribution() {
 fn test_unrelated_address_cannot_create_distribution() {
     let ctx = setup();
     let stranger = Address::generate(&ctx.env);
-    ctx.dividend.create_distribution(
-        &stranger,
-        &ctx.asset_id,
-        &ctx.pay_id,
-        &500,
-        &eligible(&ctx),
-    );
+    ctx.dividend
+        .create_distribution(&stranger, &ctx.asset_id, &ctx.pay_id, &500, &eligible(&ctx));
 }
 
 #[test]

@@ -18,7 +18,10 @@
 //! reconstruct registry activity without polling raw storage.
 
 use super::*;
-use soroban_sdk::{testutils::{Address as _, Events}, Address, Env, String};
+use soroban_sdk::{
+    testutils::{Address as _, Events},
+    Address, Env, String,
+};
 
 fn setup() -> (Env, RegistryContractClient<'static>, Address) {
     let env = Env::default();
@@ -63,7 +66,8 @@ fn reactivate_deactivated_asset_emits_one_event() {
 
     client.reactivate_asset(&admin, &id);
 
-    let events = env.events().all();
+    let all = env.events().all();
+    let events = all.events();
     assert_eq!(
         events.len(),
         1,
@@ -88,24 +92,37 @@ fn reactivate_asset_event_has_correct_topic_and_data() {
 
     client.reactivate_asset(&admin, &id);
 
-    let events = env.events().all();
+    let all = env.events().all();
+    let events = all.events();
     assert_eq!(events.len(), 1);
 
-    // Destructure: (contract_id, topics_vec, data_val)
-    let (_, topics, data) = events.get(0).unwrap();
+    // The event is an xdr::ContractEvent. Check the body for topic and data.
+    let event = events.get(0).unwrap();
+    use soroban_sdk::xdr::{ContractEventBody, ScSymbol, ScVal, StringM};
+    let (topics_vec, data_val) = match &event.body {
+        ContractEventBody::V0(body) => (&body.topics, &body.data),
+        #[allow(unreachable_patterns)]
+        _ => panic!("unexpected event body variant"),
+    };
 
     // Topic[0] must be the symbol "reactvate".
-    use soroban_sdk::{symbol_short, Val};
-    let expected_topic: Val = symbol_short!("reactvate").into();
+    assert_eq!(topics_vec.len(), 1, "event must have exactly one topic");
+    let expected_sym: StringM<32> = "reactvate".try_into().expect("valid symbol");
     assert_eq!(
-        topics.get(0).unwrap(),
-        expected_topic,
+        topics_vec[0],
+        ScVal::Symbol(ScSymbol(expected_sym)),
         "first topic must be the symbol 'reactvate'"
     );
 
     // Data must be the asset id as a u64.
-    let emitted_id: u64 = soroban_sdk::FromVal::from_val(&env, &data);
-    assert_eq!(emitted_id, id, "event data must be the reactivated asset id");
+    let emitted_id: u64 = match data_val {
+        ScVal::U64(v) => *v,
+        other => panic!("expected U64 data, got {:?}", other),
+    };
+    assert_eq!(
+        emitted_id, id,
+        "event data must be the reactivated asset id"
+    );
 }
 
 /// Reactivating an already-active asset must emit no event.
@@ -126,8 +143,9 @@ fn reactivate_already_active_asset_emits_no_event() {
 
     client.reactivate_asset(&admin, &id);
 
+    let all = env.events().all();
     assert_eq!(
-        env.events().all().len(),
+        all.events().len(),
         0,
         "reactivating an already-active asset must not emit any event"
     );
@@ -149,8 +167,9 @@ fn reactivate_emits_one_event_per_reactivation_in_sequence() {
         let _ = env.events().all();
 
         client.reactivate_asset(&admin, &id);
+        let all = env.events().all();
         assert_eq!(
-            env.events().all().len(),
+            all.events().len(),
             1,
             "each reactivation must emit exactly one event"
         );
@@ -168,8 +187,9 @@ fn failed_reactivate_emits_no_event() {
 
     let _ = client.try_reactivate_asset(&admin, &999u64);
 
+    let all = _env.events().all();
     assert_eq!(
-        _env.events().all().len(),
+        all.events().len(),
         0,
         "a failed reactivate_asset call must not emit any event"
     );
@@ -194,11 +214,26 @@ fn reactivate_multiple_assets_emits_one_event_each() {
     let _ = env.events().all();
 
     client.reactivate_asset(&admin, &id1);
-    assert_eq!(env.events().all().len(), 1, "reactivation of id1 must emit one event");
+    let all1 = env.events().all();
+    assert_eq!(
+        all1.events().len(),
+        1,
+        "reactivation of id1 must emit one event"
+    );
 
     client.reactivate_asset(&admin, &id2);
-    assert_eq!(env.events().all().len(), 1, "reactivation of id2 must emit one event");
+    let all2 = env.events().all();
+    assert_eq!(
+        all2.events().len(),
+        1,
+        "reactivation of id2 must emit one event"
+    );
 
     client.reactivate_asset(&admin, &id3);
-    assert_eq!(env.events().all().len(), 1, "reactivation of id3 must emit one event");
+    let all3 = env.events().all();
+    assert_eq!(
+        all3.events().len(),
+        1,
+        "reactivation of id3 must emit one event"
+    );
 }

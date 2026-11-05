@@ -6,11 +6,27 @@
 //! monotonically increasing id and tracks issuer, type, valuation and active
 //! status. It also reports total value locked (TVL) across active assets.
 
-use asset_token::AssetMetadata;
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, symbol_short, Address,
     Env, String, Vec,
 };
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssetMetadata {
+    pub name: String,
+    pub symbol: String,
+    pub asset_type: String,
+    pub total_supply: i128,
+    pub decimals: u32,
+    pub admin: Address,
+    pub compliance_contract: Address,
+    pub asset_description: String,
+    pub valuation: i128,
+    pub paused: bool,
+    pub guardian: Option<Address>,
+    pub pending_admin: Option<Address>,
+}
 
 // NOTE: The `Ids` instance-storage key is retained in the enum only for
 // forward-compatibility reads of contracts already deployed; it is no longer
@@ -510,7 +526,12 @@ impl RegistryContract {
             .persistent()
             .get(&DataKey::Asset(asset_id))
             .unwrap_or_else(|| panic_err(&env, Error::AssetNotFound));
-        Self::require_admin_or_asset_admin(&env, &admin, &entry.token_contract);
+        Self::require_admin_or_asset_admin(
+            &env,
+            &admin,
+            Some(&entry.issuer),
+            &entry.token_contract,
+        );
         let was_active = entry.active;
         if !was_active {
             return;
@@ -654,7 +675,7 @@ impl RegistryContract {
             .persistent()
             .get(&DataKey::Asset(asset_id))
             .unwrap_or_else(|| panic_err(&env, Error::AssetNotFound));
-        Self::require_admin_or_asset_admin(&env, &admin, &entry.token_contract);
+        Self::require_admin_or_asset_admin(&env, &admin, None, &entry.token_contract);
         if entry.active {
             return;
         }
@@ -1102,19 +1123,33 @@ impl RegistryContract {
         }
     }
 
-    fn require_admin_or_asset_admin(env: &Env, admin: &Address, asset_token: &Address) {
+    fn require_admin_or_asset_admin(
+        env: &Env,
+        admin: &Address,
+        issuer: Option<&Address>,
+        asset_token: &Address,
+    ) {
         let stored: Address = env
             .storage()
             .instance()
             .get(&DataKey::Admin)
             .unwrap_or_else(|| panic_err(env, Error::NotInitialized));
         admin.require_auth();
+        // Registry admin always permitted.
         if *admin == stored {
             return;
         }
-        let asset_admin = AssetClient::new(env, asset_token).get_metadata().admin;
-        if *admin == asset_admin {
+        // The issuer may deactivate an asset, but cannot reactivate it.
+        if issuer.is_some_and(|issuer| *admin == *issuer) {
             return;
+        }
+        // Fall back to checking if the caller is the asset-token admin.
+        // Use try_get_metadata so a missing or uninitialized token contract
+        // does not panic here — it simply means the caller is not authorized.
+        if let Ok(Ok(meta)) = AssetClient::new(env, asset_token).try_get_metadata() {
+            if *admin == meta.admin {
+                return;
+            }
         }
         panic_err(env, Error::Unauthorized);
     }

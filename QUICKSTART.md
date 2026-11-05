@@ -25,8 +25,8 @@ From a fresh clone to a fully deployed and exercised asset on testnet in
 ### 1. Clone and configure testnet
 
 ```bash
-git clone https://github.com/RWA-ToolKit/stellar-rwa-contracts.git
-cd stellar-rwa-contracts
+git clone https://github.com/pauljacobb/nexus-rwa-contracts.git
+cd nexus-rwa-contracts
 
 # Register the Testnet network with the Stellar CLI
 stellar network add testnet \

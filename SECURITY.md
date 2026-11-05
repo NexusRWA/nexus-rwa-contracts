@@ -4,7 +4,7 @@ These contracts custody real-world asset value. Please report vulnerabilities re
 
 ## Reporting a Vulnerability
 
-**Do not open a public issue.** Use [GitHub private vulnerability reporting](https://github.com/pauljacobb/STELLAR0/security/advisories/new)
+**Do not open a public issue.** Use [GitHub private vulnerability reporting](https://github.com/pauljacobb/nexus-rwa-contracts/security/advisories/new)
 to send a confidential report to the repository maintainers. Repository
 administrators must keep private vulnerability reporting enabled for this
 channel to accept reports.

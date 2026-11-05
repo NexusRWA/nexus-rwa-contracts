@@ -1,6 +1,6 @@
 # Contributing
 
-Thanks for helping build the Stellar RWA Toolkit contracts. This guide covers
+Thanks for helping build the Nexus RWA contracts. This guide covers
 local setup, testing, deployment, the compliance model, and how to extend it.
 
 ## Soroban local dev setup
