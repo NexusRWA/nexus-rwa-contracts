@@ -1,0 +1,245 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  changelog:
+    # Contract source changes must come with a CHANGELOG.md entry so the
+    # changelog can't drift as contribution rate grows. See CONTRIBUTING.md
+    # for the convention. Only runs on pull requests, where a base ref exists.
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Require CHANGELOG entry for contract changes
+        env:
+          # Label names are contributor-controlled, so pass them through the
+          # environment instead of interpolating them into the script. toJSON
+          # makes the grep an exact match on a whole element, so a label like
+          # `not-skip-changelog` cannot trigger the opt-out.
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          if printf '%s' "$PR_LABELS" | grep -q '"skip-changelog"'; then
+            echo "The skip-changelog label is applied; not requiring a CHANGELOG entry."
+            exit 0
+          fi
+          git fetch --no-tags origin "$BASE_REF"
+          ./scripts/check_changelog.sh "origin/$BASE_REF"
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      # Reads rust-toolchain.toml and installs/activates exactly the channel,
+      # targets, and components pinned there, so CI can't drift onto a newer
+      # `stable` than the one contributors build against locally.
+      - name: Install Rust
+        run: rustup show
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # Tests run before the formatting gate. A cosmetic `cargo fmt` failure
+      # used to abort the job at the first step, so `cargo test` never ran and
+      # broken code merged unnoticed. Formatting is still enforced, but it can
+      # no longer mask a compile or test failure.
+      - name: Test
+        run: cargo test --workspace
+
+      # Committed test_snapshots must match what the tests actually produce, so
+      # drift (e.g. a storage layout change without regenerated snapshots)
+      # fails CI instead of silently leaving every contributor's tree dirty.
+      - name: Check working tree is clean after tests
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "cargo test left the working tree dirty. Regenerate and commit test_snapshots:"
+            git status --porcelain
+            git diff
+            exit 1
+          fi
+
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+  build-wasm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup show
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-wasm-${{ hashFiles('**/Cargo.lock') }}
+
+      # Build the contracts to Wasm directly with cargo. This verifies the same
+      # artifacts as `stellar contract build` without compiling the full Stellar
+      # CLI from source (which needs the libdbus system library and is slow).
+      - name: Build contracts (wasm)
+        run: cargo build --workspace --release --target wasm32v1-none
+
+      # Issue #380: Publish per-contract WASM as build artifacts
+      - name: Upload WASM artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm-${{ github.sha }}
+          path: |
+            target/wasm32v1-none/release/compliance.wasm
+            target/wasm32v1-none/release/asset_token.wasm
+            target/wasm32v1-none/release/registry.wasm
+            target/wasm32v1-none/release/dividend.wasm
+          retention-days: 30
+
+      # Issue #374: Track WASM contract sizes
+      - name: Report WASM contract sizes
+        run: |
+          echo "## Contract WASM Sizes" >> $GITHUB_STEP_SUMMARY
+          for contract in compliance asset-token registry dividend; do
+            wasm_file="target/wasm32v1-none/release/${contract}.wasm"
+            if [ -f "$wasm_file" ]; then
+              size=$(wc -c < "$wasm_file")
+              size_kb=$((size / 1024))
+              echo "- **$contract**: ${size_kb}KB" >> $GITHUB_STEP_SUMMARY
+              if [ $size_kb -gt 500 ]; then
+                echo "  ⚠️  Exceeds 500KB threshold" >> $GITHUB_STEP_SUMMARY
+              fi
+            fi
+          done
+
+  interface-specs:
+    # Publishes the contract interface specification (one spec per contract) as
+    # a consumable build artifact so the web app and API can generate bindings
+    # from a single source of truth instead of hand-maintaining their own view
+    # of the interfaces. See CONTRIBUTING.md for how to consume the artifact.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup show
+
+      - name: Install Stellar CLI
+        run: cargo install --locked stellar-cli
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-specs-${{ hashFiles('**/Cargo.lock') }}
+
+      # Fails if the committed specs in specs/interface/ are stale, i.e. a public
+      # contract function changed without regenerating them with
+      # `make update-interface-specs`.
+      - name: Check committed interface specs are up to date
+        run: make check-interface-specs
+
+      - name: Upload interface specs
+        uses: actions/upload-artifact@v4
+        with:
+          name: interface-specs
+          path: target/interface-specs/*.json
+          if-no-files-found: error
+
+  check-quickstart:
+    # Verify QUICKSTART.md does not reference non-existent scripts, a wrong
+    # wasm target, or the deprecated soroban-cli. Runs on every PR so doc
+    # drift is caught before merge (issue #443).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check QUICKSTART.md is consistent with the repo
+        run: bash scripts/check_quickstart.sh
+
+  coverage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        run: rustup show
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-coverage-${{ hashFiles('**/Cargo.lock') }}
+
+      # Report-only for now: prints a per-crate summary to the job's PR check
+      # so reviewers have a coverage signal. No floor is enforced yet -- that
+      # needs a separate discussion to agree a sane threshold first.
+      - name: Generate coverage summary
+        run: |
+          {
+            echo "### Coverage summary"
+            echo '```'
+            cargo llvm-cov --workspace --summary-only
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  lint-scripts:
+    # Validate shell scripts and verify that script paths mentioned in docs
+    # actually exist in the repository (issue #431).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install shellcheck
+        run: sudo apt-get install -y shellcheck
+
+      - name: Run shellcheck on all shell scripts
+        run: |
+          find scripts -name '*.sh' -print0 | xargs -0 shellcheck
+
+      - name: Run bash -n syntax check on all shell scripts
+        run: |
+          find scripts -name '*.sh' -print0 | xargs -0 -I{} bash -n {}
+
+      - name: Verify DEPLOYMENTS.md only references scripts that exist
+        run: |
+          ERRORS=0
+          while IFS= read -r script_path; do
+            if [ ! -f "$script_path" ]; then
+              echo "ERROR: DEPLOYMENTS.md references '$script_path' which does not exist."
+              ERRORS=$((ERRORS + 1))
+            fi
+          done < <(grep -oP 'scripts/[a-zA-Z0-9_\-]+\.sh' DEPLOYMENTS.md | sort -u)
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "Fix DEPLOYMENTS.md to match the actual script filenames."
+            exit 1
+          fi
+          echo "OK: all script references in DEPLOYMENTS.md exist."

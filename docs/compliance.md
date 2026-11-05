@@ -1,0 +1,395 @@
+# Compliance Contract
+
+The compliance contract is the **core differentiator** of the RWA Toolkit. It
+maintains the KYC allowlist and jurisdiction rules that decide who may hold or
+transfer a tokenized asset. The asset-token contract calls
+[`is_allowed`](#is_allowed---bool) on **both** parties of every transfer and on
+the recipient of every mint.
+
+- Testnet: `CBUERYDM7DXTZLLKDBRJKUBPFJ7M4OSUN4T7XKUARU345RLXNAIQD2IU`
+
+## Types
+
+### `ComplianceStatus`
+
+```rust
+enum ComplianceStatus { Approved, Pending, Rejected, Suspended }
+```
+
+`Pending` and `Rejected` are retained only for ABI compatibility and are
+explicitly deprecated. The current contract never writes them, and no public
+method can create them; `Approved` and `Suspended` are the only reachable
+states from the supported workflows. Only `Approved` records (that are not
+expired and not in a blocked jurisdiction) pass `is_allowed`.
+
+### `KycRecord`
+
+| Field         | Type              | Meaning                                             |
+|---------------|-------------------|-----------------------------------------------------|
+| `address`     | `Address`         | The account this record applies to                  |
+| `status`      | `ComplianceStatus`| Approval state                                      |
+| `jurisdiction`| `String`          | Canonical ISO-3166-1 alpha-2 country code, e.g. `"US"` |
+| `verified_at` | `u32`             | Ledger sequence at verification                     |
+| `expires_at`  | `u32`             | Ledger sequence of expiry; `0` = never expires      |
+
+> Time is measured in **ledger sequence numbers**, not calendar dates.
+
+### Jurisdiction canonical form
+
+To prevent "USA", "us", and "US" from being silently treated as three
+different jurisdictions, every jurisdiction string passed to
+`add_to_allowlist`, `block_jurisdiction`, `unblock_jurisdiction`, and
+`is_jurisdiction_blocked` is normalized and validated before use:
+
+- Interior/leading/trailing ASCII spaces are stripped.
+- Letters are upper-cased.
+- The result **must** be exactly 2 ASCII alphabetic characters (a real
+  ISO-3166-1 alpha-2 code such as `US`, `KE`, `DE`).
+
+Anything else — 1 or 3+ letters, digits, punctuation, or an empty string —
+panics with `InvalidJurisdiction (#6)`. Stored records and blocked-jurisdiction
+keys always hold the canonical 2-letter uppercase form, so lookups by any
+casing/whitespace variant of the same code resolve to the same jurisdiction.
+> **The `expires_at = 0` sentinel.** `0` means the approval **never
+> expires**. This is load-bearing: the web app passes `0` for
+> non-expiring approvals, and `is_allowed` skips the expiry comparison
+> entirely whenever `expires_at == 0`, so a zero-expiry record can never
+> lapse no matter how far the ledger advances. `0` is never a real expiry
+> ledger sequence, so there is no collision with genuinely-expired records.
+
+## Functions
+
+### `initialize(admin: Address)`
+Sets the admin. Callable once. Requires `admin` auth.
+Errors: `AlreadyInitialized (#1)`.
+
+### `add_to_allowlist(admin, address, jurisdiction, expires_at)`
+Approves `address` (status → `Approved`) in `jurisdiction`, expiring at
+`expires_at` (`0` = never). Admin only.
+Errors: `Unauthorized (#5)`, `InvalidExpiry (#4)` if `expires_at` is already in
+the past.
+
+### `suspend(admin, address)`
+Sets an existing record to `Suspended`; `is_allowed` returns `false` until
+re-approved or reinstated. Admin only. Errors: `RecordNotFound (#3)`,
+`Unauthorized (#5)`.
+
+### `reinstate(admin, address)`
+Restores a `Suspended` record to `Approved` **without discarding its
+original KYC metadata** — `jurisdiction`, `verified_at`, and `expires_at`
+are left untouched, unlike calling `add_to_allowlist` again (which requires
+resupplying those fields and overwrites `verified_at`). Admin only.
+Errors: `RecordNotFound (#3)`, `NotSuspended (#8)` if the record is not
+currently `Suspended`.
+
+### `remove(admin, address)`
+Deletes a record and removes the address from the allowlist. Admin only.
+Errors: `RecordNotFound (#3)`, `Unauthorized (#5)`.
+
+### `is_allowed(address) -> bool`
+The gate used by the asset token. Returns `true` **iff** the address has a
+record that is `Approved`, not expired, and whose jurisdiction is not blocked.
+Never panics.
+
+### `get_record(address) -> Option<KycRecord>`
+Raw record, or `None`.
+
+### `get_allowlist() -> Vec<Address>`
+Every address currently on the allowlist. Costs scale with the size of the
+list — prefer `get_allowlist_count` when the caller does not need the full
+list.
+
+### `get_allowlist_count() -> u32`
+Number of addresses currently on the allowlist, in O(1). Backed by a
+counter maintained on every append/removal (not a walk over `get_allowlist`),
+so a caller that only needs a count never pays to transfer every address.
+The counter is unaffected by `suspend`, since that does not add or remove
+page membership — it always matches `get_allowlist().len()`.
+
+### `get_allowlist_page(offset: u32, limit: u32) -> Vec<Address>`
+Pages through the allowlist. `offset` skips that many addresses from the
+start; `limit` is clamped to `MAX_ALLOWLIST_PAGE_SIZE` (200) — pass `0` or
+anything above the max to get the max page size back. An `offset` at or past
+the end of the list returns an empty `Vec`, which signals the final page has
+already been consumed.
+
+### `block_jurisdiction(admin, jurisdiction)` / `unblock_jurisdiction(admin, jurisdiction)`
+Block/unblock an entire country code. Approved addresses in a blocked
+jurisdiction fail `is_allowed`. Admin only.
+
+### `is_jurisdiction_blocked(jurisdiction) -> bool`
+Whether a jurisdiction is currently blocked.
+
+### `get_blocked_jurisdictions() -> Vec<String>`
+Every jurisdiction currently blocked, in the order it was first blocked.
+Previously the web app had to *infer* the blocked set from which
+jurisdictions had no approved KYC records — a jurisdiction blocked before it
+ever had an approved address was invisible that way. This reads the
+contract's authoritative blocked set directly, so that inference workaround
+is no longer needed.
+
+### `get_admin() -> Address`
+The configured admin. Errors: `NotInitialized (#2)`.
+
+### `propose_admin(admin, new_admin)` / `accept_admin(new_admin)` / `cancel_admin_proposal(admin)`
+Two-step admin handover: the **current** admin proposes a successor, and the
+role moves only when that successor calls `accept_admin` (proving it controls
+the address). The current admin can cancel a pending proposal. See
+[issue #4](fixes/issue-4.md) and the [CLI handover walkthrough](admin-handover.md).
+
+### `set_min_holding_period(admin, holder, min_ledgers: u64)`
+Set or clear a per-address minimum holding period (issue #454). Admin only.
+`min_ledgers = 0` removes the requirement. Emits `minhld` with
+`(holder, min_ledgers)`. Errors: `Unauthorized (#5)`, `NotInitialized (#2)`.
+
+### `record_acquisition(admin, holder)`
+Record the current ledger sequence as `holder`'s first-acquisition time
+(issue #454). Idempotent — a second call is a no-op; the stored ledger is
+never overwritten so the clock always starts at the earliest acquisition.
+Emits `acquired` with `(holder, ledger)` on the first call only. Admin only.
+Errors: `Unauthorized (#5)`, `NotInitialized (#2)`.
+
+### `get_min_holding_period(holder) -> Option<u64>`
+Return the minimum holding period (ledgers) for `holder`, or `None`.
+
+### `get_first_acquired_ledger(holder) -> Option<u64>`
+Return the first-acquisition ledger for `holder`, or `None`.
+
+## Minimum holding period (issue #454)
+
+A **minimum holding period** enforces a per-address lock-up: a holder cannot
+transfer tokens until at least `min_ledgers` ledger sequences have elapsed
+since their first token acquisition. This supports IPO lock-ups, vesting
+schedules, and anti-flip mechanisms for regulated distributions.
+
+### How it works
+
+1. **Admin sets a holding period** for a holder via
+   `set_min_holding_period(admin, holder, min_ledgers)`.  
+   `min_ledgers = 0` removes the requirement entirely.
+
+2. **Asset-token (or another admin-authorised caller) records the acquisition**
+   via `record_acquisition(admin, holder)` when the holder first receives
+   tokens. Subsequent calls are **idempotent** — the stored ledger is never
+   updated once set, so a later top-up does not restart the lock-up clock.
+
+3. **`is_allowed(holder)` enforces the period.** If both a minimum period and a
+   `FirstAcquiredLedger` entry exist for the holder, the check asserts:
+   ```
+   env.ledger().sequence() >= first_acquired_ledger + min_ledgers
+   ```
+   If the condition is not met, `is_allowed` returns `false` and emits an
+   `hldfail` event. If no `FirstAcquiredLedger` entry exists for the holder,
+   the check is **skipped (fail-open)** so existing holders whose acquisition
+   was never recorded are not inadvertently locked out.
+
+> **Burning tokens** is not affected by compliance checks: the asset-token
+> contract's `burn` function does not call `is_allowed`, so a locked-up holder
+> can still burn their own tokens even inside the holding period.
+
+### New functions
+
+#### `set_min_holding_period(admin, holder, min_ledgers: u64)`
+Set or clear a holding period for `holder`. Admin only.  
+`min_ledgers = 0` removes the entry.  
+Errors: `Unauthorized (#5)`, `NotInitialized (#2)`.
+
+**Event emission (issue #518).** Every state change made by
+`set_min_holding_period` publishes a `minhld` event:
+
+- Topics: `(Symbol("minhld"), holder)`
+- Data: `min_ledgers` (the `u64` value just written)
+
+The event is emitted on **both** paths — setting a non-zero period and
+clearing it with `min_ledgers = 0` — and is published **after** the storage
+write completes, so an indexer that observes `minhld` can treat it as
+authoritative: the corresponding `MinHoldingPeriod` entry already reflects
+the emitted value (present for non-zero, absent for `0`). This lets the
+indexing API reconstruct holding-period activity from events alone, without
+polling raw contract storage.
+
+**Resource cost (issue #519).** A baseline test measures the CPU and memory
+cost of `set_min_holding_period`; the recorded figures live alongside that
+test in `contracts/compliance/src/lib.rs` (see the resource-cost baseline
+test for the current numbers).
+
+#### `record_acquisition(admin, holder)`
+Record the current ledger sequence as `holder`'s first-acquisition time.
+Idempotent — repeated calls are no-ops.  
+Emits `acquired` with `(holder, ledger)` on the first call only.  
+Errors: `Unauthorized (#5)`, `NotInitialized (#2)`.
+
+#### `get_min_holding_period(holder) -> Option<u64>`
+Return the minimum holding period in ledgers, or `None` if none is set.
+
+#### `get_first_acquired_ledger(holder) -> Option<u64>`
+Return the recorded first-acquisition ledger, or `None` if not yet recorded.
+
+## Errors
+
+| Code | Name                | Cause                                   |
+|------|---------------------|-----------------------------------------|
+| 1    | AlreadyInitialized  | `initialize` called twice               |
+| 2    | NotInitialized      | Used before `initialize`                |
+| 3    | RecordNotFound      | Operating on a missing record           |
+| 4    | InvalidExpiry       | `expires_at` already in the past        |
+| 5    | Unauthorized        | Caller is not the stored admin          |
+| 6    | InvalidJurisdiction | Jurisdiction is not 2 ASCII letters after normalization |
+| 7    | NoPendingAdmin      | `accept_admin`/`cancel_admin_proposal` with no pending proposal |
+| 8    | NotSuspended        | `reinstate` called on a non-`Suspended` record |
+| 9    | InvalidHoldingPeriod | `set_min_holding_period` called with an overflowing value |
+
+## Events
+
+| Topic        | Data                                          | When                                        |
+|--------------|-----------------------------------------------|---------------------------------------------|
+| `init`       | admin address                                 | on initialize                               |
+| `approved`   | (address) → (jurisdiction, expires_at, ...)   | address approved or re-approved             |
+| `suspend`    | (address) → ()                                | address suspended                           |
+| `reinstat`   | (address) → ()                                | suspended address reinstated                |
+| `removed`    | (address) → ()                                | address removed                             |
+| `blockjur`   | → jurisdiction                                | jurisdiction blocked                        |
+| `unblkjur`   | → jurisdiction                                | jurisdiction unblocked                      |
+| `set_admin`  | (old_admin) → new_admin                       | admin handed over                           |
+| `expired`    | (address) → expires_at                        | expired record found by `is_allowed` or `prune_expired` |
+| `minhld`     | (holder) → min_ledgers                        | holding period set or cleared               |
+| `acquired`   | (holder) → first_acquired_ledger (`u64`)      | first acquisition recorded by `record_acquisition` |
+| `hldfail`    | (holder) → (first_acquired, min_ledgers, now) | `is_allowed` denied because hold period has not elapsed |
+
+## Minimum holding period (issue #454)
+
+A **minimum holding period** enforces a per-address lock-up window: a holder
+may not transfer tokens until at least `min_ledgers` ledger sequences have
+elapsed since their *first* recorded token acquisition.
+
+### Use cases
+- IPO lock-up periods (e.g. 90–180 days ≈ 1,555,200–3,110,400 ledgers at 5 s/ledger)
+- Vesting schedules for employee token grants
+- Anti-flip rules for initial distributions
+- Regulatory restricted-securities holding requirements
+
+### How it composes with other rules
+
+The holding-period check runs last inside `is_allowed`, after the status,
+expiry, and jurisdiction checks. All four conditions must pass for
+`is_allowed` to return `true`:
+
+```
+is_allowed(address)
+  1. record exists and status == Approved
+  2. not expired (expires_at == 0 or now < expires_at)
+  3. jurisdiction not blocked
+  4. now >= first_acquired_ledger + min_holding_period   ← new (issue #454)
+```
+
+### Fail-open for unrecorded acquisitions
+
+If a `MinHoldingPeriod` is set for an address but no `FirstAcquiredLedger`
+entry has been written via `record_acquisition`, condition 4 is treated as
+satisfied (fail-open). This preserves backwards compatibility for holders
+whose token acquisition pre-dates the holding-period feature.
+
+### Interaction with suspension
+
+The holding-period clock is independent of the KYC lifecycle. `suspend`,
+`reinstate`, and re-approval via `add_to_allowlist` do **not** read or write
+the `FirstAcquiredLedger` entry, so:
+
+- The clock is **not reset** on reinstatement (or on re-approval). The
+  first-acquisition ledger recorded before suspension is kept.
+- Ledgers elapsed **while suspended count toward** `min_holding_period`. A
+  holder suspended for longer than the lock-up window is eligible to transfer
+  immediately after reinstatement, provided their other `is_allowed`
+  conditions pass.
+- A suspended address fails `is_allowed` on condition 1 before the hold check
+  is reached, so no `hldfail` event is emitted during suspension.
+
+### Burning is unaffected
+
+The asset-token `burn` function does not call `is_allowed`, so a holder
+can always burn their own tokens even inside the lock-up window.
+
+### Events added
+
+| Topic     | Data                                          | When                              |
+|-----------|-----------------------------------------------|-----------------------------------|
+| `minhld`  | (holder) → min_ledgers                        | holding period set or cleared     |
+| `acquired`| (holder) → first_acquired_ledger              | first acquisition recorded        |
+| `hldfail` | (holder) → (first_acquired, min_ledgers, now) | `is_allowed` denied by hold rule  |
+
+`minhld` is emitted by `set_min_holding_period` with topics
+`(Symbol("minhld"), holder)` and data `min_ledgers`, on both the set and the
+clear (`min_ledgers = 0`) paths. It is published after the storage write, so
+indexers can rely on it to reconstruct holding-period activity without
+reading raw storage (issue #518).
+
+## Storage / TTL
+
+Listing of the contract `DataKey` variants and their storage behaviour.
+
+| Key | Payload | Storage | TTL / Notes |
+|-----|---------|---------|-------------|
+| `Admin` | - | instance | - |
+| `Allowlist` | - | instance | - |
+| `Record` | Address | persistent | per-key TTL |
+| `Blocked` | String | persistent | existence flag per jurisdiction |
+| `BlockedList` | - | instance | ordered `Vec<String>` backing `get_blocked_jurisdictions` |
+| `MinHoldingPeriod` | Address | persistent | per-key TTL; absent when no holding period set |
+| `FirstAcquiredLedger` | Address | persistent | per-key TTL; written once by `record_acquisition`; bumped only on that first write (see below) |
+
+### `FirstAcquiredLedger` TTL bump strategy (issue #496)
+
+- **Bump site:** `record_acquisition` in `contracts/compliance/src/lib.rs`.
+  The `extend_ttl` call on `FirstAcquiredLedger` sits inside the first-write
+  branch (`if !env.storage().persistent().has(&key)`), so it runs once when the
+  entry is created, extending it to `INSTANCE_BUMP_AMOUNT` (30 days of ledgers).
+- **Not bumped on later calls:** a repeat `record_acquisition` for the same
+  holder takes the no-op path and does not extend TTL. `is_allowed` and
+  `get_first_acquired_ledger` read the entry without bumping it.
+- **Consequence:** the entry expires about 30 days after the first acquisition
+  is recorded, regardless of the holding period. Once archived, `is_allowed`
+  sees no record and fails open, so the lock-up is silently lifted. Keeping the
+  record alive past that point requires a bump that the contract does not
+  currently perform.
+- `MinHoldingPeriod` is bumped on every `set_min_holding_period` call with a
+  non-zero value, so it is refreshed by admin action only.
+- `scripts/generate_storage_docs.py` cannot see this bump. It only matches
+  `DataKey::X` inside the call, while the contract passes a local `key`
+  variable, so regenerating the section marks `FirstAcquiredLedger` as
+  `unknown` with no TTL note. Re-apply this section by hand after running it.
+
+## Admin independence from the asset-token admin (issue #3)
+
+The admin stored by this contract is entirely separate from the `admin`
+stored by any asset-token contract that points at it as its
+`compliance_contract`. The two are never compared, and neither contract reads
+the other's admin — the asset token only ever calls the read-only
+`is_allowed`.
+
+[`scripts/deploy.sh`](../scripts/deploy.sh) initializes both contracts with
+the same address (`$ADMIN_ADDR`). That is a **convenience default** for
+standing up a single-operator demo/testnet deployment in one command, **not**
+a requirement of the contracts. A real issuer can run compliance under a
+dedicated compliance officer's address while a different address administers
+the asset token, simply by calling `initialize` on each contract with a
+different admin, e.g.:
+
+```bash
+invoke "$COMPLIANCE_ID" initialize --admin "$COMPLIANCE_OFFICER_ADDR"
+invoke "$ASSET_ID" initialize --admin "$ISSUER_ADDR" ...
+```
+
+`contracts/asset-token/src/test.rs::test_compliance_admin_diverges_from_asset_admin`
+proves this: it initializes the two contracts with distinct admins, shows the
+compliance officer can independently approve/suspend addresses and the asset
+admin can independently mint/pause, and confirms neither admin can act on the
+other's contract.
+
+## Security considerations
+
+- All state-changing functions require the **stored admin** to both authorize
+  (`require_auth`) and match the passed `admin` argument.
+- `is_allowed` is intentionally total (never panics) so the asset token can rely
+  on it inside transfers.
+- Expiry is enforced against `env.ledger().sequence()` at read time, so an
+  expired KYC blocks transfers without any keeper/cron.

@@ -1,0 +1,22 @@
+[package]
+name = "asset-token"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["lib", "cdylib"]
+doctest = false
+
+[features]
+testutils = ["soroban-sdk/testutils"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+proptest = "1.5"
+# Used only in tests to deploy a real compliance contract for the
+# cross-contract compliance checks.
+compliance = { path = "../compliance", features = ["testutils"] }
